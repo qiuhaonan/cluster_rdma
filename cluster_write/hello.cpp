@@ -257,11 +257,11 @@ static void resources_init(struct resources *res)
     res->io_size = 0;
     res->traffic_class = 0;
     res->sgid_index = 0;
-    res->batch_size = 0;
+    res->batch_size = 1;
     res->test_num = 0;
     res->verbose = 0;
     res->run_infinitely = 0;
-    res->iteration = 0;
+    res->iteration = 1000;
     res->perform_warmup = 0;
     res->event_or_poll = 0;
     res->cluster_size = 2;
