@@ -6,13 +6,15 @@
 #include <string>
 #include <sys/mman.h>
 #include <cstdlib>
+#include <cassert>
 #include <sys/time.h>
 #include <tuple>
 #include <iomanip>
 
 using namespace std;
 
-enum RecordFields {SIZE, CPY, REG, DEG, REG_DEG};
+enum RecordFields {SIZE, CPY, REG, DEG, REG_DEG, MLOCK};
+enum Type {SMALL, BIG};
 
 class infiniband_device
 {
@@ -24,11 +26,11 @@ class infiniband_device
     int    iteration;
     void*  srcbuf;
     void*  dstbuf;
-    vector<tuple<int, double, double, double, double>> small_page;
-    vector<tuple<int, double, double, double, double>> big_page;
-    bool   small_big;
+    vector<tuple<int, double, double, double, double, double>> small_page;
+    vector<tuple<int, double, double, double, double, double>> big_page;
+    Type   test_type;
 
-    infiniband_device() : ib_ctx(nullptr), ib_pd(nullptr), device_name("mlx5_0"), mem_size(1024 * 1024 * 1024), srcbuf(nullptr), dstbuf(nullptr), small_big(false), iteration(10) {}
+    infiniband_device() : ib_ctx(nullptr), ib_pd(nullptr), device_name("mlx5_0"), mem_size(1024 * 1024 * 1024), srcbuf(nullptr), dstbuf(nullptr), test_type(SMALL), iteration(10) {}
     ~infiniband_device()
     {
         if(ib_pd)
@@ -124,7 +126,7 @@ void infiniband_device::allocate_buffer_using_small_page()
     dstbuf = malloc(mem_size);
     memset(srcbuf, 'a', mem_size);
     memset(dstbuf, 'a', mem_size);
-    small_big = false;
+    test_type = SMALL;
 }
 
 void infiniband_device::free_buffer_using_small_page()
@@ -142,19 +144,19 @@ void infiniband_device::free_buffer_using_big_page()
 void infiniband_device::allocate_buffer_using_big_page()
 {
     mem_size = ((mem_size / (2 * 1024 * 1024)) + 1) * (2 * 1024 * 1024);
+    cout << "Allocate " << mem_size / (2 * 1024 * 1024) << " x 2MB Page" << endl;
     srcbuf = mmap(nullptr, mem_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
     dstbuf = mmap(nullptr, mem_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
     memset(srcbuf, 'a', mem_size);
     memset(dstbuf, 'a', mem_size);
-    small_big = true;
+    test_type = BIG;
 }
 
 void infiniband_device::run_test()
 {
     for (uint64_t i = 8; i <= (mem_size / 2); i = i * 2)
     {
-        double cpy_sum = 0, reg_sum = 0, deg_sum = 0;
-        vector<double> cpy, reg, deg;
+        double cpy_sum = 0, reg_sum = 0, deg_sum = 0, mlock_sum = 0;
         // choose addr 
         auto offset = random_offset(mem_size, i);
         
@@ -166,50 +168,51 @@ void infiniband_device::run_test()
             auto start = std::chrono::high_resolution_clock::now();
             memcpy(dstptr, srcptr, i);
             auto end = std::chrono::high_resolution_clock::now();
-            cpy.push_back(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());    
+            cpy_sum += (std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());    
             
             void* ptr = (void*)(((char*)srcbuf) + offset);
             start = std::chrono::high_resolution_clock::now();
             ibv_mr *mr = ibv_reg_mr(ib_pd, ptr, i, IBV_ACCESS_LOCAL_WRITE);
             end = std::chrono::high_resolution_clock::now();
-            reg.push_back(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+            reg_sum += (std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
 
             start = std::chrono::high_resolution_clock::now();
             ibv_dereg_mr(mr);
             end = std::chrono::high_resolution_clock::now();
-            deg.push_back(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+            deg_sum += (std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+
+            void* mptr = (void*)(((char*)srcbuf) + offset);
+            start = std::chrono::high_resolution_clock::now();
+            assert(mlock(mptr, i) == 0);
+            end = std::chrono::high_resolution_clock::now();
+            mlock_sum += (std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+            assert(munlock(mptr, i) == 0); 
         }
 
-        for (int k = 0; k < iteration; ++k)
-        {
-            reg_sum += reg[k];
-            deg_sum += deg[k];
-            cpy_sum += cpy[k];
-        }
-        if ( small_big == false)
-            small_page.push_back(make_tuple(i, cpy_sum/iteration, reg_sum/iteration, deg_sum/iteration, (reg_sum + deg_sum)/iteration));
+        if (test_type == SMALL)
+            small_page.push_back(make_tuple(i, cpy_sum/iteration, reg_sum/iteration, deg_sum/iteration, (reg_sum + deg_sum)/iteration, mlock_sum/iteration));
         else 
-            big_page.push_back(make_tuple(i, cpy_sum/iteration, reg_sum/iteration, deg_sum/iteration, (reg_sum + deg_sum)/iteration));
+            big_page.push_back(make_tuple(i, cpy_sum/iteration, reg_sum/iteration, deg_sum/iteration, (reg_sum + deg_sum)/iteration, mlock_sum/iteration));
     }
 }
 
 void infiniband_device::output_small_page_test()
 {
     int num = small_page.size();
-    cout << setw(10) << "Type" << setw(10) << "Bytes" << setw(10) << "CPY(us)" << setw(10) << "REG(us)" << setw(10) << "DEG(us)" << setw(10) << "REDEG(us)"<< endl;
+    cout << setw(10) << "Type" << setw(10) << "Bytes" << setw(10) << "CPY(us)" << setw(10) << "REG(us)" << setw(10) << "DEG(us)" << setw(10) << "REDEG(us)" << setw(10) << "MLOCK(us)" << endl;
     for(int i = 0; i<num; ++i)
     {
-        cout << setw(10) << "4K Page" << setw(10) << std::get<SIZE>(small_page[i]) << setw(10) << std::get<CPY>(small_page[i]) << setw(10) << std::get<REG>(small_page[i]) << setw(10) << std::get<DEG>(small_page[i]) << setw(10) << std::get<REG_DEG>(small_page[i]) << endl;
+        cout << setw(10) << "4K Page" << setw(10) << std::get<SIZE>(small_page[i]) << setw(10) << std::get<CPY>(small_page[i]) << setw(10) << std::get<REG>(small_page[i]) << setw(10) << std::get<DEG>(small_page[i]) << setw(10) << std::get<REG_DEG>(small_page[i]) << setw(10) << std::get<MLOCK>(small_page[i]) << endl;
     }
 }
 
 void infiniband_device::output_big_page_test()
 {
     int num = big_page.size();
-    cout << setw(10) << "Type" << setw(10) << "Bytes" << setw(10) << "CPY(us)" << setw(10) << "REG(us)" << setw(10) << "DEG(us)" << setw(10) << "REDEG(us)"<< endl;
+    cout << setw(10) << "Type" << setw(10) << "Bytes" << setw(10) << "CPY(us)" << setw(10) << "REG(us)" << setw(10) << "DEG(us)" << setw(10) << "REDEG(us)" << setw(10) << "MLOCK(us)" << endl;
     for(int i = 0; i<num; ++i)
     {
-        cout << setw(10) << "2M Page" << setw(10) << std::get<SIZE>(big_page[i]) << setw(10) << std::get<CPY>(big_page[i]) << setw(10) << std::get<REG>(big_page[i]) << setw(10) << std::get<DEG>(big_page[i]) << setw(10) << std::get<REG_DEG>(big_page[i]) << endl;
+        cout << setw(10) << "2M Page" << setw(10) << std::get<SIZE>(big_page[i]) << setw(10) << std::get<CPY>(big_page[i]) << setw(10) << std::get<REG>(big_page[i]) << setw(10) << std::get<DEG>(big_page[i]) << setw(10) << std::get<REG_DEG>(big_page[i]) << setw(10) << std::get<MLOCK>(big_page[i])<< endl;
     }
 }
 
